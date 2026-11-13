@@ -28,6 +28,22 @@ export const DEFAULT_MARK_STYLES: Record<string, MarkStyleResolver> = {
 }
 
 
+// ─── Inline atoms ──────────────────────────────────────────────────────────
+
+/**
+ * Stands in for an inline atom in a block's text (U+FFFC, OBJECT REPLACEMENT
+ * CHARACTER — what it is for). One UTF-16 unit, matching the atom's node size
+ * of one, and a grapheme of its own; see `inlineBlockText`.
+ */
+export const INLINE_ATOM_CHAR = '￼'
+/** Default horizontal padding on each side of an inline atom's label. */
+export const INLINE_ATOM_PAD_X = 4
+/** Default corner radius of an inline atom's chip. */
+export const INLINE_ATOM_RADIUS = 4
+/** Chip height as a multiple of the font size (capped at the line height). */
+export const INLINE_ATOM_HEIGHT_EM = 1.3
+
+
 // ─── List geometry ─────────────────────────────────────────────────────────
 
 /** Horizontal indent added per list nesting level. */

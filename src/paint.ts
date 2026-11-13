@@ -18,8 +18,11 @@ import type { Selection } from 'prosemirror-state'
 import type {
     CursorDecoration, Decoration, InlineDecoration, NodeDecoration,
 } from './decoration'
-import type { BlockLayout, LineFragment, LineLayout, TableChrome } from './types'
+import type {
+    BlockLayout, InlineAtomBox, LineFragment, LineLayout, TableChrome,
+} from './types'
 import {
+    INLINE_ATOM_HEIGHT_EM,
     CARET_LABEL_FONT, CARET_LABEL_HEIGHT, CARET_LABEL_PAD_X, CARET_LABEL_PAD_Y,
     REMOTE_CARET_WIDTH, TABLE_BORDER, TEXT_BLEED,
 } from './constants'
@@ -221,6 +224,9 @@ export function paintToCanvas(
             if (!line.fragments) continue
             for (const frag of line.fragments)
             {
+                // An inline atom's chip is a background too: it goes down here
+                // so a selection over the atom still reads as selected.
+                if (frag.atom) paintInlineAtomChip(ctx, frag.atom, line.x + frag.x, line.y, block)
                 if (!frag.background) continue
                 ctx.fillStyle = frag.background
                 ctx.fillRect(line.x + frag.x, line.y, frag.width, block.lineHeight)
@@ -310,6 +316,13 @@ export function paintToCanvas(
                     ctx.font = frag.font
                     ctx.fillStyle = frag.color ?? lineColor
                     const fy = line.y + (frag.baselineShift ?? 0)
+                    if (frag.atom)
+                    {
+                        // The label, inset into the chip painted earlier. The
+                        // fragment's own text is only the offset placeholder.
+                        ctx.fillText(frag.atom.text, line.x + frag.x + frag.atom.inset, fy)
+                        continue
+                    }
                     ctx.fillText(frag.text, line.x + frag.x, fy)
                     if (frag.underline || frag.strikethrough)
                     {
@@ -502,6 +515,12 @@ function splitRunsByColor(
     const out: LineFragment[] = []
     for (const run of runs)
     {
+        // An inline atom is one indivisible box with its own colors.
+        if (run.atom)
+        {
+            out.push(run)
+            continue
+        }
         const runEnd = run.pmStart + run.text.length
         const cuts: number[] = []
         for (const s of slices)
@@ -538,6 +557,40 @@ function splitRunsByColor(
         }
     }
     return out
+}
+
+/**
+ * The rounded box behind an inline atom's label. Text is painted from the top
+ * of its line box, so the chip hugs the glyphs' em box rather than the whole
+ * line: on a tall line height it would otherwise read as a block, not a pill.
+ */
+function paintInlineAtomChip(
+    ctx: CanvasRenderingContext2D,
+    atom: InlineAtomBox,
+    x: number,
+    y: number,
+    block: BlockLayout,
+): void
+{
+    if (!atom.background && !atom.borderColor) return
+    const h = Math.min(block.lineHeight, Math.round(block.fontSize * INLINE_ATOM_HEIGHT_EM))
+    const half = atom.borderWidth / 2
+    ctx.beginPath()
+    ctx.roundRect(
+        x + half, y + half, atom.width - atom.borderWidth, h - atom.borderWidth,
+        Math.min(atom.borderRadius, h / 2),
+    )
+    if (atom.background)
+    {
+        ctx.fillStyle = atom.background
+        ctx.fill()
+    }
+    if (atom.borderColor)
+    {
+        ctx.strokeStyle = atom.borderColor
+        ctx.lineWidth = atom.borderWidth
+        ctx.stroke()
+    }
 }
 
 /** A remote participant's caret, with their name on a flag beside it. */

@@ -105,6 +105,15 @@ export interface CanvasEditorOptions
      * document position (e.g. for `NodeSelection.create(state.doc, getPos())`).
      */
     nodeViews?: Record<string, NodeViewFn>
+    /**
+     * Inline leaf/atom nodes drawn on the canvas as a chip *within* a text line
+     * (mentions, tags, pills). Keyed by node type name. The chip is measured as
+     * one unbreakable box (Pretext's `break: 'never'` + `extraWidth`), occupies
+     * exactly the node's one document position, is hit-tested as a unit (click
+     * → `NodeSelection`), and can't hold the caret. A node type not listed here
+     * keeps the previous behaviour.
+     */
+    inlineAtoms?: Record<string, InlineAtomSpec>
     /** Called after every render with timing/cache stats. */
     onRender?: (stats: RenderStats) => void
     /**
@@ -150,6 +159,61 @@ export interface CanvasEditorOptions
      * still needs a `nodeViews` entry that renders + positions it.
      */
     floatRect?: (node: PMNode) => { x: number, y: number, width: number } | null
+}
+
+/** How an inline atom node is drawn. See `inlineAtoms`. */
+export interface InlineAtomSpec
+{
+    /** The text drawn inside the chip, e.g. `@Ada`. It sizes the chip, and is
+     *  what a plain-text copy carries when the schema defines no `leafText`. */
+    text: (node: PMNode) => string
+    /** Chip styling — fixed, or a function of the node to read its attributes. */
+    style?: InlineAtomStyle | ((node: PMNode) => InlineAtomStyle | null)
+}
+
+/** Styling of an inline atom's chip. Everything is optional: an unstyled atom
+ *  is drawn as plain text in the surrounding run's font and color. */
+export interface InlineAtomStyle
+{
+    /** Label color. Default: the surrounding run's color. */
+    color?: string
+    /** Chip fill. Default: none. */
+    background?: string
+    /** Chip outline color. Drawn only when `borderWidth` > 0. */
+    borderColor?: string
+    /** Outline width in px. Default: 0. */
+    borderWidth?: number
+    /** Corner radius in px. Default: 4. */
+    borderRadius?: number
+    /** Horizontal padding (px) on each side of the label. Default: 4. */
+    paddingX?: number
+    /** CSS font-weight of the label. */
+    fontWeight?: string | number
+    /** CSS font-style of the label. */
+    fontStyle?: 'normal' | 'italic' | 'oblique'
+    /** CSS font-family override for the label. */
+    fontFamily?: string
+}
+
+/**
+ * A laid-out inline atom, carried on its line fragment. The fragment's own
+ * `text` starts with the one-character placeholder that keeps line text in
+ * lockstep with document offsets; this is what actually gets painted.
+ */
+export interface InlineAtomBox
+{
+    node: PMNode
+    /** The label drawn inside the chip. */
+    text: string
+    /** Full chip width: label + padding + border. */
+    width: number
+    /** Left inset of the label within the chip (padding + border). */
+    inset: number
+    color: string | null
+    background: string | null
+    borderColor: string | null
+    borderWidth: number
+    borderRadius: number
 }
 
 /** Builds the DOM for a leaf/atom block node. See `nodeViews`. */
@@ -297,6 +361,8 @@ export interface LineFragment
     strikethrough?: boolean
     /** Vertical paint offset for super/subscript runs. */
     baselineShift?: number
+    /** Set when this run is an inline atom: paint the chip, not `text`. */
+    atom?: InlineAtomBox
 }
 
 export interface LineLayout
@@ -447,6 +513,7 @@ export interface CachedFragment
     underline?: boolean
     strikethrough?: boolean
     baselineShift?: number
+    atom?: InlineAtomBox
 }
 
 export interface CachedLine
@@ -499,6 +566,8 @@ export interface MarkedLineCtx
         pmStart: number, leadTrim: number, font: string,
         color: string | null, background: string | null, trimmed: string,
         underline: boolean, strikethrough: boolean, baselineShift: number,
+        /** An inline atom item: one document position, drawn as a chip. */
+        atom?: InlineAtomBox,
     }[]
     blockText: string
     consumed: number[]

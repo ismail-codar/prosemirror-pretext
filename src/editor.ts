@@ -47,9 +47,10 @@ import type {
     RenderStats, LineFragment, LineLayout, BlockLayout,
     ResolvedBlockStyle, BlockDesc, CachedFragment, CachedLine, CachedBlock,
     MountedView, MarkedLineCtx, MarkedSegment, LayoutFrame, TableChrome,
-    CanvasGeometry,
+    CanvasGeometry, InlineAtomSpec,
 } from './types'
 import {
+    INLINE_ATOM_CHAR,
     HEADING_SCALE, DEFAULT_MARK_STYLES, LIST_INDENT, MARKER_PAD,
     FOCUSABLE_SEL, SR_ONLY, DRAG_THRESHOLD_PX, TEXT_BLEED,
     AUTOSCROLL_ZONE_PX, AUTOSCROLL_SPEED_PX,
@@ -66,6 +67,7 @@ import { applyVirtualLayout, paintToCanvas, type PaintContext } from './paint'
 import {
     blockHasMarks, resolveRunStyle, resolveBlockStyle, boxFields, blockBase,
     blockContentWidth, type StyleContext,
+    blockHasInlineAtoms, inlineBlockText, resolveInlineAtom,
 } from './layout/style'
 
 // The public types live in ./types but are re-exported here so `src/index.ts`
@@ -75,6 +77,7 @@ export type {
     MarkStyle, MarkStyleResolver, BlockStyle, BlockStyleResolver,
     RenderStats, LineFragment, LineLayout, BlockLayout,
     LayoutFrame, TableChrome, TableCellBox, CanvasGeometry,
+    InlineAtomSpec, InlineAtomStyle,
 } from './types'
 
 /**
@@ -188,6 +191,9 @@ export class CanvasEditor {
   // Measured heights so layout can reserve space for each atom block.
   private readonly nodeViewHeights = new Map<PMNode, number>();
   private readonly defaultAtomHeight = 40;
+  // Inline atoms drawn as chips within a line (see `inlineAtoms`). Empty by
+  // default, in which case no block ever leaves the paths it took before.
+  private readonly inlineAtoms: Record<string, InlineAtomSpec>;
   // Transient decorations: a resolver + the live widget DOM (keyed for reuse).
   private readonly decorationsFor:
     | ((state: EditorState) => Decoration[])
@@ -462,6 +468,7 @@ export class CanvasEditor {
         window.open(href, "_blank", "noopener");
       });
     this.nodeViews = options.nodeViews ?? {};
+    this.inlineAtoms = options.inlineAtoms ?? {};
     this.decorationsFor = options.decorations ?? null;
     this.handlers = options.handlers ?? {};
     this.dragDrop = options.dragDrop !== false;
@@ -719,6 +726,9 @@ export class CanvasEditor {
     if (sel instanceof GapCursor) return "Between blocks";
     if (sel instanceof NodeSelection) {
       const n = sel.node;
+      // An inline atom reads as what it shows (`@Ada`), not its type name.
+      const atom = n.isInline ? this.inlineAtoms[n.type.name] : undefined;
+      if (atom) return `${atom.text(n)}, selected`;
       const alt = n.attrs["alt"] as string | undefined;
       return `${n.type.name}${alt ? `, ${alt}` : ""}, selected`;
     }
@@ -1066,7 +1076,7 @@ export class CanvasEditor {
     const base = this.blockBase(node, indent);
     const frameX = frame?.x ?? 0;
     const frameW = frame?.width ?? this.containerWidth;
-    const text = node.textContent;
+    const text = this.blockText(node);
     if (text.length === 0) {
       return {
         prepared: null,
@@ -1136,7 +1146,59 @@ export class CanvasEditor {
   }
 
   private blockHasMarks(node: PMNode): boolean {
-    return blockHasMarks(node);
+    // An inline atom is its own rich-inline item, so a block holding one takes
+    // the marked path even when none of its text carries a mark.
+    return blockHasMarks(node) || blockHasInlineAtoms(node, this.inlineAtoms);
+  }
+
+  /** A textblock's text in document-offset space (see `inlineBlockText`). */
+  private blockText(node: PMNode): string {
+    return inlineBlockText(node, this.inlineAtoms);
+  }
+
+  /** The registered inline atom starting at `pos`, or null. */
+  private inlineAtomAt(pos: number): PMNode | null {
+    if (pos < 0 || pos >= this.state.doc.content.size) return null;
+    const node = this.state.doc.nodeAt(pos);
+    return node && !node.isText && node.isInline && node.isLeaf &&
+      this.inlineAtoms[node.type.name]
+      ? node
+      : null;
+  }
+
+  /** Node-select the inline atom under a document-space point. Returns
+   *  whether there was a selectable one there. */
+  private selectInlineAtomAt(x: number, y: number): boolean {
+    const pos = this.inlineAtomPosAtCoords(x, y);
+    const node = pos === null ? null : this.inlineAtomAt(pos);
+    if (pos === null || !node || !NodeSelection.isSelectable(node)) return false;
+    this.dispatch(
+      this.state.tr.setSelection(NodeSelection.create(this.state.doc, pos)),
+    );
+    return true;
+  }
+
+  /**
+   * The document position of the inline atom whose chip is under a
+   * document-space point, or null. Tested against the chip itself rather than
+   * its fragment, which also carries the whitespace that follows the atom.
+   */
+  private inlineAtomPosAtCoords(x: number, y: number): number | null {
+    for (const block of this.lastLayouts) {
+      if (block.isAtom || y < block.yOffset || y > block.yOffset + block.height)
+        continue;
+      for (const line of block.lines) {
+        if (!line.fragments || y < line.y || y >= line.y + block.lineHeight)
+          continue;
+        for (const f of line.fragments) {
+          if (!f.atom) continue;
+          const left = line.x + f.x;
+          if (x >= left && x <= left + f.atom.width)
+            return block.pmStartPos + f.pmStart;
+        }
+      }
+    }
+    return null;
   }
 
   /** What ./layout/table needs: the block gap, and a way to lay a cell's
@@ -1275,7 +1337,7 @@ export class CanvasEditor {
     node: PMNode,
     base: ResolvedBlockStyle,
   ): { segments: MarkedSegment[]; blockText: string } {
-    const blockText = node.textContent;
+    const blockText = this.blockText(node);
     type Run = {
       font: string;
       color: string | null;
@@ -1317,6 +1379,42 @@ export class CanvasEditor {
 
     let offset = 0;
     node.forEach((child) => {
+      const atomSpec = child.isText || !child.isLeaf
+        ? undefined
+        : this.inlineAtoms[child.type.name];
+      if (atomSpec) {
+        // An inline atom is one item Pretext may not break (`break: 'never'`)
+        // whose chrome rides along as `extraWidth`, so the line is broken to
+        // the width the chip is painted at. It never merges into a text run.
+        flushRun();
+        const { font, box } = resolveInlineAtom(
+          this.styleCx,
+          atomSpec,
+          child,
+          base,
+          (text, f) => this.measureWidth(text, f),
+        );
+        seg.items.push({
+          text: box.text,
+          font,
+          break: "never",
+          extraWidth: box.inset * 2,
+        });
+        seg.meta.push({
+          pmStart: offset,
+          leadTrim: 0,
+          font,
+          color: box.color,
+          background: null,
+          trimmed: INLINE_ATOM_CHAR,
+          underline: false,
+          strikethrough: false,
+          baselineShift: 0,
+          atom: box,
+        });
+        offset += child.nodeSize;
+        return;
+      }
       const childText = child.isText ? (child.text ?? "") : "";
       const style = this.resolveRunStyle(child.marks, base);
       const parts = childText.split("\n");
@@ -1421,7 +1519,7 @@ export class CanvasEditor {
   /** Float-aware counterpart of layoutBlock: lays each line at its own width. */
   private layoutBlockAt(node: PMNode, topY: number, indent = 0): CachedBlock {
     const base = this.blockBase(node, indent);
-    const text = node.textContent;
+    const text = this.blockText(node);
     if (text.length === 0) {
       return {
         prepared: null,
@@ -1464,7 +1562,11 @@ export class CanvasEditor {
       const start = ctx.consumed[f.itemIndex];
       // Pretext collapses runs of whitespace inside a fragment; re-expand
       // against the source so every space stays a real editable character.
-      const [text, end] = expandCollapsedWhitespace(m.trimmed, start, f.text);
+      // An inline atom is the exception: whatever its label, it is the one
+      // placeholder character its node occupies in the block's text.
+      const [text, end] = m.atom
+        ? [INLINE_ATOM_CHAR, 1]
+        : expandCollapsedWhitespace(m.trimmed, start, f.text);
       ctx.consumed[f.itemIndex] = end;
       const pmStart = m.pmStart + m.leadTrim + start;
 
@@ -1502,7 +1604,7 @@ export class CanvasEditor {
         lineText += gap;
       }
 
-      const width = this.measureWidth(text, m.font);
+      const width = m.atom ? m.atom.width : this.measureWidth(text, m.font);
       fragments.push({
         text,
         font: m.font,
@@ -1514,6 +1616,7 @@ export class CanvasEditor {
         underline: m.underline,
         strikethrough: m.strikethrough,
         baselineShift: m.baselineShift,
+        ...(m.atom ? { atom: m.atom } : {}),
       });
       x += width;
       lineText += text;
@@ -1764,12 +1867,12 @@ export class CanvasEditor {
     const layout: BlockLayout = {
       type: node.type.name,
       node,
-      text: node.textContent,
+      text: this.blockText(node),
       yOffset: cursorY,
       height: blockHeight,
       lines: positioned,
       pmStartPos: pos + 1,
-      pmEndPos: pos + 1 + node.textContent.length,
+      pmEndPos: pos + 1 + this.blockText(node).length,
       lineHeight: cached.lineHeight,
       font: cached.font,
       fontSize: cached.fontSize,
@@ -2042,7 +2145,7 @@ export class CanvasEditor {
           sameMarker(reuse.marker, marker)
         ) {
           reuse.pmStartPos = pos + 1;
-          reuse.pmEndPos = pos + 1 + node.textContent.length;
+          reuse.pmEndPos = pos + 1 + this.blockText(node).length;
           result.push(reuse);
           cursorY += reuse.height + this.blockGap;
           this.cacheHits++;
@@ -2260,10 +2363,13 @@ export class CanvasEditor {
         if (offsetInBlock <= f.pmStart) return line.x + f.x;
         if (offsetInBlock <= fEnd) {
           this.measureCtx.font = f.font;
+          // Past an inline atom's one offset the caret is at the chip's right
+          // edge; anything further is the whitespace that trails it.
+          const skip = f.atom ? 1 : 0;
           const w = this.measureCtx.measureText(
-            f.text.substring(0, offsetInBlock - f.pmStart),
+            f.text.substring(skip, offsetInBlock - f.pmStart),
           ).width;
-          return line.x + f.x + w;
+          return line.x + f.x + (f.atom ? f.atom.width : 0) + w;
         }
       }
       const last = line.fragments[line.fragments.length - 1];
@@ -2542,6 +2648,24 @@ export class CanvasEditor {
             const prev = frags[i - 1];
             const mid = (prev.x + prev.width + f.x) / 2;
             return targetX < mid ? prev.pmStart + prev.text.length : f.pmStart;
+          }
+          if (f.atom) {
+            // No offset lies inside the chip: snap to whichever side is
+            // nearer. Past it, hit-test the whitespace that trails the atom.
+            const local = targetX - f.x;
+            if (local <= f.atom.width)
+              return local < f.atom.width / 2 ? f.pmStart : f.pmStart + 1;
+            return (
+              f.pmStart +
+              1 +
+              hitTestInText(
+                this.measureCtx,
+                this.segmenter,
+                f.text.substring(1),
+                f.font,
+                local - f.atom.width,
+              )
+            );
           }
           return (
             f.pmStart +
@@ -3062,6 +3186,14 @@ export class CanvasEditor {
           return;
         }
 
+        // A press on an inline atom's chip selects the node, as a click on an
+        // atom block does. Shift still extends a text range across it.
+        if (!e.shiftKey && this.selectInlineAtomAt(x, y)) {
+          this.dragging = false;
+          this.textarea.focus();
+          return;
+        }
+
         this.setHead(hit.pos, e.shiftKey);
         this.caretBias = hit.bias;
         this.dragging = true;
@@ -3270,8 +3402,10 @@ export class CanvasEditor {
               this.textarea.focus({ preventScroll: true });
               return;
             }
-            this.setHead(hit.pos, false);
-            this.caretBias = hit.bias;
+            if (!this.selectInlineAtomAt(x, y)) {
+              this.setHead(hit.pos, false);
+              this.caretBias = hit.bias;
+            }
           }
         }
         this.touchSelection = false; // collapsed caret → hide handles
@@ -3815,7 +3949,7 @@ export class CanvasEditor {
     if (joinBackward(this.state, (tr) => this.dispatch(tr))) return;
     const $from = sel.$from;
     if ($from.parent.isTextblock) {
-      const text = $from.parent.textContent;
+      const text = this.blockText($from.parent);
       const prev = prevGraphemeBoundary(
         this.segmenter,
         text,
@@ -3843,7 +3977,7 @@ export class CanvasEditor {
     if (joinForward(this.state, (tr) => this.dispatch(tr))) return;
     const $to = sel.$to;
     if ($to.parent.isTextblock) {
-      const text = $to.parent.textContent;
+      const text = this.blockText($to.parent);
       const next = nextGraphemeBoundary(this.segmenter, text, $to.parentOffset);
       const delta = next - $to.parentOffset;
       if (delta > 0) {
@@ -4009,7 +4143,14 @@ export class CanvasEditor {
   private selectionText(): string | null {
     const sel = this.state.selection;
     if (sel.empty) return null;
-    return this.state.doc.textBetween(sel.from, sel.to, "\n");
+    // A leaf's text is the schema's `leafText` when it defines one; an inline
+    // atom without one falls back to the label it is drawn with, so a mention
+    // doesn't vanish from a plain-text copy.
+    return this.state.doc.textBetween(sel.from, sel.to, "\n", (leaf) => {
+      const own = leaf.type.spec.leafText;
+      if (own) return own(leaf);
+      return this.inlineAtoms[leaf.type.name]?.text(leaf) ?? "";
+    });
   }
 
   /**
@@ -4411,7 +4552,7 @@ export class CanvasEditor {
   private steppedGraphemePos(pos: number, direction: 1 | -1): number {
     const $pos = this.state.doc.resolve(pos);
     if (!$pos.parent.isTextblock) return pos + direction;
-    const text = $pos.parent.textContent;
+    const text = this.blockText($pos.parent);
     const offset = $pos.parentOffset;
     if (direction > 0) {
       const next = nextGraphemeBoundary(this.segmenter, text, offset);
@@ -4446,7 +4587,18 @@ export class CanvasEditor {
   }
 
   private moveSelection(delta: number, extend: boolean): void {
-    const head = this.state.selection.head;
+    const sel = this.state.selection;
+    // A selected inline atom collapses to its near edge, the way a text range
+    // would, rather than stepping a further grapheme past it.
+    if (
+      !extend &&
+      sel instanceof NodeSelection &&
+      this.inlineAtomAt(sel.from)
+    ) {
+      this.setHead(delta < 0 ? sel.from : sel.to, false, delta < 0 ? -1 : 1);
+      return;
+    }
+    const head = sel.head;
     const target =
       delta === 1 || delta === -1
         ? this.steppedGraphemePos(head, delta)

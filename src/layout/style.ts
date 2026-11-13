@@ -15,7 +15,9 @@
 import type { Mark, Node as PMNode } from 'prosemirror-model'
 import type {
     BlockStyleResolver, MarkStyleResolver, ResolvedBlockStyle,
+    InlineAtomSpec, InlineAtomBox,
 } from '../types'
+import { INLINE_ATOM_CHAR, INLINE_ATOM_PAD_X, INLINE_ATOM_RADIUS } from '../constants'
 
 /** The editor configuration style resolution reads. Nothing mutable. */
 export interface StyleContext
@@ -187,4 +189,93 @@ export function blockBase(
 export function blockContentWidth(cx: StyleContext, base: ResolvedBlockStyle): number
 {
     return cx.containerWidth - base.paddingLeft - base.paddingRight
+}
+
+
+// ─── Inline atoms ──────────────────────────────────────────────────────────
+
+/** Whether any inline child of a block is a registered inline atom. */
+export function blockHasInlineAtoms(
+    node: PMNode,
+    inlineAtoms: Record<string, InlineAtomSpec>,
+): boolean
+{
+    let has = false
+    node.forEach((child) =>
+    {
+        if (!child.isText && child.isLeaf && inlineAtoms[child.type.name]) has = true
+    })
+    return has
+}
+
+/**
+ * A textblock's text in *document offset* space: `node.textContent`, except
+ * that every registered inline atom contributes exactly `nodeSize` placeholder
+ * characters (one), whatever its label or `leafText` says.
+ *
+ * Layout, hit-testing, selection rects, and grapheme stepping all treat "char
+ * offset in the block" and "PM offset in the block" as the same number. Text
+ * nodes make that true by construction; an atom breaks it unless it takes up
+ * exactly the one offset its node does. With the placeholder in place every
+ * consumer of block text stays correct without knowing atoms exist, and a
+ * grapheme step over it is a step over the whole atom.
+ */
+export function inlineBlockText(
+    node: PMNode,
+    inlineAtoms: Record<string, InlineAtomSpec>,
+): string
+{
+    if (!blockHasInlineAtoms(node, inlineAtoms)) return node.textContent
+    let text = ''
+    node.forEach((child) =>
+    {
+        text += !child.isText && child.isLeaf && inlineAtoms[child.type.name]
+            ? INLINE_ATOM_CHAR.repeat(child.nodeSize)
+            : child.textContent
+    })
+    return text
+}
+
+/**
+ * Resolve an inline atom to its font and the box painted for it. The label
+ * inherits the surrounding run's style (so a mention in a heading is heading
+ * sized); the atom's own style overrides weight/style/family and color.
+ */
+export function resolveInlineAtom(
+    cx: StyleContext,
+    spec: InlineAtomSpec,
+    node: PMNode,
+    base: ResolvedBlockStyle,
+    measure: (text: string, font: string) => number,
+): { font: string, box: InlineAtomBox }
+{
+    const run = resolveRunStyle(cx, node.marks, base)
+    const st = (typeof spec.style === 'function' ? spec.style(node) : spec.style) ?? {}
+    const ownFont = st.fontWeight !== undefined || st.fontStyle || st.fontFamily
+    const font = ownFont
+        ? `${st.fontStyle ?? base.fontStyle} ${
+            st.fontWeight !== undefined ? String(st.fontWeight) : base.fontWeight
+        } ${base.fontSize}px ${st.fontFamily ?? base.fontFamily}`
+            .replace(/\s+/g, ' ')
+            .trim()
+        : run.font
+    // Pretext drops an item whose text is empty or all collapsible whitespace;
+    // a no-break space keeps a label-less atom a real, measurable box.
+    const text = spec.text(node).replace(/\s+/g, ' ').trim() || ' '
+    const borderWidth = st.borderWidth ?? 0
+    const inset = (st.paddingX ?? INLINE_ATOM_PAD_X) + borderWidth
+    return {
+        font,
+        box: {
+            node,
+            text,
+            width: measure(text, font) + inset * 2,
+            inset,
+            color: st.color ?? run.color,
+            background: st.background ?? null,
+            borderColor: borderWidth > 0 ? (st.borderColor ?? null) : null,
+            borderWidth,
+            borderRadius: st.borderRadius ?? INLINE_ATOM_RADIUS,
+        },
+    }
 }
