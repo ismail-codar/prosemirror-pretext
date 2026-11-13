@@ -2872,6 +2872,44 @@ export class CanvasEditor {
       { signal },
     );
 
+    // Input the browser cannot apply to an empty textarea, taken before it
+    // tries. A replacement (autocorrect, a picked suggestion) names the new
+    // text but not the old: handled here it never reaches the textarea, so the
+    // `input` below does not also insert it. A delete with nothing in the
+    // textarea produces no `input` at all, and on a soft keyboard the keydown
+    // is `Unidentified`, so this event is the only sign of it.
+    this.textarea.addEventListener(
+      "beforeinput",
+      (e) => {
+        const ie = e as InputEvent;
+        if (this.composing || ie.isComposing) return;
+
+        switch (ie.inputType) {
+          case "insertReplacementText": {
+            const text =
+              ie.data ?? ie.dataTransfer?.getData("text/plain") ?? "";
+            if (!text) break;
+            e.preventDefault();
+            this.replaceText(text);
+            break;
+          }
+
+          case "deleteContentBackward":
+            if (this.textarea.value !== "") break;
+            e.preventDefault();
+            this.deleteBackward();
+            break;
+
+          case "deleteContentForward":
+            if (this.textarea.value !== "") break;
+            e.preventDefault();
+            this.deleteForward();
+            break;
+        }
+      },
+      { signal },
+    );
+
     this.textarea.addEventListener(
       "input",
       (e) => {
@@ -2879,10 +2917,14 @@ export class CanvasEditor {
         if (this.composing || ie.isComposing) return;
 
         switch (ie.inputType) {
+          case "insertReplacementText":
+            // Only reached where `beforeinput` was not delivered.
+            if (ie.data) this.replaceText(ie.data);
+            break;
+
           case "insertText":
           case "insertFromPaste":
           case "insertFromDrop":
-          case "insertReplacementText":
             if (!ie.data) break;
             // Typing at a gap cursor starts a new paragraph in the seam.
             if (this.state.selection instanceof GapCursor)
@@ -3792,6 +3834,46 @@ export class CanvasEditor {
       if ($from.node(d).type === itemType) return true;
     }
     return false;
+  }
+
+  /**
+   * Apply an `insertReplacementText`: put `text` in place of what it corrects.
+   *
+   * The event cannot say where that is. `getTargetRanges()` is empty for a
+   * textarea, and this one holds no text outside a composition, so its own
+   * selection is always collapsed at 0. The range is therefore read off the
+   * document: a non-empty selection, else the word the caret is in or just
+   * after — the only word a keyboard would be correcting. With neither, the
+   * text is inserted at the caret as before.
+   */
+  private replaceText(text: string): void {
+    const sel = this.state.selection;
+    if (sel instanceof GapCursor) {
+      this.insertAtGap(text);
+      return;
+    }
+    const range = sel.empty ? this.wordBeforeCaret() : null;
+    if (!range) {
+      this.dispatch(this.state.tr.insertText(text));
+      return;
+    }
+    const tr = this.state.tr.insertText(text, range.from, range.to);
+    tr.setSelection(TextSelection.create(tr.doc, range.from + text.length));
+    this.dispatch(tr);
+  }
+
+  /** The word-like segment the caret sits inside or at the end of, or null. */
+  private wordBeforeCaret(): { from: number; to: number } | null {
+    const $from = this.state.selection.$from;
+    if (!$from.parent.isTextblock) return null;
+    const offset = $from.parentOffset;
+    for (const seg of this.wordSegmenter.segment(this.blockText($from.parent))) {
+      const end = seg.index + seg.segment.length;
+      if (seg.index >= offset) break;
+      if (seg.isWordLike && offset <= end)
+        return { from: $from.pos - (offset - seg.index), to: $from.pos + (end - offset) };
+    }
+    return null;
   }
 
   private deleteBackward(): void {
